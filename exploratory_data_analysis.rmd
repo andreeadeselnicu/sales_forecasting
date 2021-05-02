@@ -1,0 +1,419 @@
+---
+title: "Deep dive into sales data"
+author: "Andreea Deselnicu"
+date: "1 May 2021"
+output: 
+  html_document:
+    toc: true
+    theme: united
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Intro
+In this notebook, we will explore data with scope to understand it. This step is done in `R` for the rapid prototyping and exploring. For the graphics, we will use `GGplot2` with a custom template and pass them to `plotly's ggplotly()` function for the interactivity. 
+For further modeling we will switch to `Python`
+
+# Data load & preps
+```{r load packages & data, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(cowplot)
+library(plotly)
+library(scales)
+library(lubridate)
+library(DT)
+library(ggcorrplot)
+library(prophet)
+
+sales <- read_csv("data/sales_per_store_per_day.csv", 
+                  col_types = cols(
+                    Store = col_double(),
+                    DayOfWeek = col_double(),
+                    Date = col_date(format = ""),
+                    Sales = col_double(),
+                    Customers = col_double(),
+                    Open = col_double(),
+                    Promo = col_double(),
+                    StateHoliday = col_character(),
+                    SchoolHoliday = col_double()))
+```
+
+At first glance at data, we can conclude below:
+
+* There are 1115 distinct `stores`
+* Granularity of the table is at the `date & store level`
+* `customers` is the number of total customers from the store for a specific date
+* Stores seem to be closed on Sundays, excepting a small subset 
+* State & School holidays are not the same for all stores, which means, stores are from different counties or states in the case of USA
+* First sales date is `2013-01-01`
+* Last sales date is `2015-06-30`
+
+Small data processing
+```{r prepare data, message=FALSE, warning=FALSE}
+sales <- sales %>%
+  rename(store = Store,
+         date = Date, 
+         sales = Sales,
+         customers = Customers,
+         open = Open) %>%
+  mutate(state_holiday = factor(StateHoliday, levels = c("0", "a", "b", "c"), ordered = TRUE),
+         school_holiday = factor(SchoolHoliday),
+         promo = factor(Promo),
+         year = year(date),
+         month = month(date), 
+         month_day = day(date),
+         week_day = weekdays(date),
+         week_day = factor(
+           week_day, 
+           levels = c("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"),
+           ordered = TRUE),
+         close = ifelse(open == 1, 0, 1),
+         open_fct = factor(open),
+         close_fct = factor(close))%>%
+  select(-c(DayOfWeek, Promo, StateHoliday, SchoolHoliday))
+```
+
+Few variables and functions to avoid boilerplate codes
+```{r ggplot theme, message=FALSE, warning=FALSE}
+color_theme = "#34495e"
+color_font = "#2c3e50"
+font = "Georgia"
+
+theme_template <- function() {
+  theme_minimal() %+replace% 
+  theme(plot.title = element_text(hjust = 0.5, size = 12, family = font, color = color_font, face = "bold"),
+        axis.title = element_text(family = font, color = color_font, size = 10),
+        axis.text.y = element_text(family = font, color = color_font, size = 8),
+        axis.text.x = element_text(family = font, color = color_font, size = 8, 
+                                   angle = 45, hjust = 1, vjust = 1),
+        legend.title = element_text(family = font, color = color_font, size = 9),
+        legend.text = element_text(family = font, color = color_font, size = 8))
+}
+```
+
+# Store types
+Let's check overall sales and see if we can observe any patterns or anomalies!
+```{r overall sales by date, message=FALSE, warning=FALSE}
+plot_overall_sales_by_date <- sales %>%
+  group_by(date) %>%
+  summarise(sales = sum(sales))  %>%
+  ggplot(aes(x = date, y = sales)) +
+  geom_point(size = 1, color = color_theme) +
+  geom_line(alpha = 0.8, color = color_theme) +
+  labs(title = "Overall sales by date") +
+  xlab("Date") +
+  ylab("Sales") +
+  theme_template() +
+  scale_x_date(date_breaks = "3 months",  date_minor_breaks = "months", date_labels = "%Y-%b")
+ggplotly(plot_overall_sales_by_date)
+```
+
+From the above visualization, we can observe patterns on weekdays also a biweekly pattern (which most probably will be explained by the diversity of stores). Also, on Sundays, sales drop drastically, we can not take this as a global pattern on weekdays. Most probably there are a small set of stores which are open on Sundays too. Let's identify them!
+
+```{r average store sales, echo=FALSE, message=FALSE, warning=FALSE}
+plot_avg_store_sales_by_date <- sales %>%
+  group_by(date) %>%
+  summarise(sales = sum(sales)/sum(open))  %>%
+  ggplot(aes(x = date, y = sales)) +
+  geom_point(size = 1, color = color_theme) +
+  geom_line(alpha = 0.8, color = color_theme) +
+  labs(title = "Average store level sales by date") +
+  xlab("Date") +
+  ylab("Sales") +
+  theme_template() +
+  scale_x_date(date_breaks = "3 months",  date_minor_breaks = "months", date_labels = "%Y-%b")
+ggplotly(plot_avg_store_sales_by_date)
+```
+The plot above confirms the theory about non-stop stores.
+
+Let's calculated number of closed days by stores!
+```{r no open and close days by store, message=FALSE, warning=FALSE}
+no_open_close_days_store <- sales %>%
+  group_by(store) %>%
+  summarise(no_open_days = sum(open),
+            no_closed_days = sum(close)) %>%
+  mutate(close_percentage = no_closed_days/(no_closed_days + no_open_days)) %>%
+  arrange(-close_percentage) 
+
+no_open_close_days_store %>%
+  datatable(caption = "Store open/close days", 
+            colnames = c("Store", "No open days", "No closed days", "Close %"))
+```
+
+We have 10 non-stop stores. Let's split the data set into 2 and explore them separately
+```{r non stop stores, message=FALSE, warning=FALSE}
+non_stop_stores <- no_open_close_days_store %>%
+  filter(close_percentage < 0.03) %>%
+  select(store) %>%
+  pull()
+
+sales_non_stop_stores <- sales %>%
+  filter(store %in% non_stop_stores)
+
+sales_wo_non_stop_stores <- sales %>%
+  filter(!store %in% non_stop_stores)
+
+plot_sales_non_stop_stores <- sales_non_stop_stores %>%
+  group_by(date) %>%
+  summarise(sales = sum(sales))  %>%
+  ggplot(aes(x = date, y = sales)) +
+  geom_point(size = 1, color = color_theme) +
+  geom_line(alpha = 0.8, color = color_theme) +
+  labs(title = "Summarised sales by date") +
+  ylab("non-stop") +
+  theme_template() +
+  scale_x_date(date_breaks = "3 months",  date_minor_breaks = "months") +
+  theme(axis.title.x = element_blank(),
+        axis.text.x = element_blank())
+
+plot_sales_wo_non_stop_stores <- sales_wo_non_stop_stores %>%
+  group_by(date) %>%
+  summarise(sales = sum(sales))  %>%
+  ggplot(aes(x = date, y = sales)) +
+  geom_point(size = 1, color = color_theme) +
+  geom_line(alpha = 0.8, color = color_theme) +
+  labs(title = "Summarised sales by date") +
+  ylab("w/o non-stop") +
+  xlab("Date") +
+  theme_template() +
+  scale_x_date(date_breaks = "3 months",  date_minor_breaks = "months") +
+  theme(plot.title = element_blank())
+
+plot_grid(plot_sales_non_stop_stores, plot_sales_wo_non_stop_stores, ncol = 1, nrow = 2)
+```
+
+Let's check if there are stores with incomplete timeline
+```{r stores with missing data, message=FALSE, warning=FALSE}
+stores_with_incomplete_timeline <- sales %>%
+  group_by(store) %>%
+  summarise(min_date = min(date),
+            max_date = max(date),
+            no_days = length(date)) %>%
+  mutate(no_days_complete = max_date - min_date + 1) %>%
+  filter(no_days < no_days_complete) %>%
+  select(store) %>%
+  pull()
+
+sales %>%
+  filter(store %in% stores_with_incomplete_timeline) %>%
+  group_by(date) %>%
+  summarise(sales = sum(sales)/sum(open))  %>%
+  ggplot(aes(x = date, y = sales)) +
+  geom_point(size = 1, color = color_theme) +
+  geom_line(alpha = 0.8, color = color_theme) +
+  labs(title = "Average store level sales by date") +
+  xlab("Date") +
+  ylab("Sales") +
+  theme_template() +
+  scale_x_date(date_breaks = "3 months",  date_minor_breaks = "months", date_labels = "%Y-%b")
+```
+
+There are 180 stores with incomplete timeline, we will need to treat them separately. 
+
+# Patterns in the date features
+
+Let's see if we can find visible patterns on the weekdays and months
+```{r weekday seasonalities for non-stop stores, message=FALSE, warning=FALSE}
+sales_non_stop_stores %>% 
+  group_by(week_day, month_day) %>%
+  summarise(avg_sales = mean(sales)) %>%
+  ggplot(aes(month_day, week_day, fill = avg_sales)) + 
+  geom_tile() +
+  scale_fill_gradient(low="#ecf0f1", high="#c0392b") +
+  labs(title = "Average sales by Week Day & Month Day for non-stop stores") +
+  xlab("Month Day") +
+  ylab("Week Day") +
+  theme_template() +
+  theme(axis.text.x = element_text(angle = 0, hjust = 0, vjust = 0)) +
+  guides(fill = guide_legend(title = "Average Sales")) +
+  scale_x_continuous(breaks = c(1:31))
+```
+
+```{r weekday seasonalities w/o non-stop stores, message=FALSE, warning=FALSE}
+sales_wo_non_stop_stores %>% 
+  group_by(week_day, month_day) %>%
+  summarise(avg_sales = mean(sales)) %>%
+  ggplot(aes(month_day, week_day, fill = avg_sales)) + 
+  geom_tile() +
+  scale_fill_gradient(low="#ecf0f1", high="#c0392b") +
+  labs(title = "Average sales by Week Day & Month Day w/o non-stop stores") +
+  xlab("Month Day") +
+  ylab("Week Day") +
+  theme_template() +
+  theme(axis.text.x = element_text(angle = 0, hjust = 0, vjust = 0)) +
+  guides(fill = guide_legend(title = "Average Sales")) +
+  scale_x_continuous(breaks = c(1:31))
+```
+
+```{r montly seasonalities, message=FALSE, warning=FALSE}
+sales %>% 
+  group_by(year, month, store) %>%
+  summarise(sales = sum(sales)) %>%
+  group_by(year, month) %>%
+  summarise(avg_sales = mean(sales)) %>%
+  ggplot(aes(month, year, fill = avg_sales)) + 
+  geom_tile() +
+  scale_fill_gradient(low="#ecf0f1", high="#c0392b") +
+  labs(title = "Average sales by Year & Month") +
+  xlab("Month") +
+  ylab("Year") +
+  theme_template() +
+  theme(axis.text.x = element_text(angle = 0, hjust = 0, vjust = 0)) +
+  guides(fill = guide_legend(title = "Average Sales")) +
+  scale_x_continuous(breaks = c(1:12))
+```
+
+# Store level metrics
+
+```{r store level metrics, message=FALSE, warning=FALSE}
+sales %>%
+  mutate(cust_sales = sales/customers) %>%
+  group_by(store) %>%
+  summarise(sales = sum(sales),
+            no_days = length(date),
+            avg_day_sales = sales/no_days,
+            avg_cust_sales = mean(cust_sales, na.rm = TRUE),
+            avg_no_cust = mean(customers)) %>%
+  arrange(-sales) %>%
+  datatable(caption = "Store level metrics", colnames = c("Store", "Sales", "No Days", "Avg Daily Sales", "Avg Cust Sales", "Avg Cust No"))
+```
+
+# State & School Holidays
+
+```{r global holiday analysis, message=FALSE, warning=FALSE}
+holidays_global <- sales %>%
+  group_by(date) %>%
+  summarise(avg_sales = sum(sales)/sum(open),
+            state_holiday = max(ifelse(state_holiday != "0", 1, 0)),
+            school_holiday = max(ifelse(school_holiday == 1, 1, 0)),
+            holiday = max(state_holiday, school_holiday))  
+
+school_holidays <- holidays_global %>%
+  filter(school_holiday == 1) %>%
+  select(date) %>%
+  pull()
+
+state_holidays <- holidays_global %>%
+  filter(state_holiday == 1) %>%
+  select(date) %>%
+  pull()
+
+holidays_global %>%
+  ggplot(aes(x = date, y = avg_sales)) +
+  geom_vline(xintercept = school_holidays, alpha = 0.1, color = "grey") +
+  geom_vline(xintercept = state_holidays, alpha = 0.1, color = "red") +
+  geom_point(size = 1, color = color_theme) +
+  geom_line(alpha = 0.8, color = color_theme) +
+  labs(title = "Average store sales, state(red) & school(grey) holidays") +
+  xlab("Sales") +
+  ylab("Date") +
+  theme_template() +
+  scale_x_date(date_breaks = "3 months",  date_minor_breaks = "months", date_labels = "%Y-%b")
+```
+
+Holidays for a single store (Store 1)
+
+```{r holiday analysis for store 1, message=FALSE, warning=FALSE}
+store_sales <- sales %>%
+  filter(store == 1)
+
+store_school_holidays <- store_sales %>%
+  filter(school_holiday == 1) %>%
+  select(date) %>%
+  pull()
+
+store_state_holidays <- store_sales %>%
+  filter(state_holiday != "0") %>%
+  select(date) %>%
+  pull()
+
+ store_sales %>%
+  ggplot(aes(x = date, y = sales)) +
+  geom_vline(xintercept = store_school_holidays, alpha = 0.1, color = "grey") +
+  geom_vline(xintercept = store_state_holidays, alpha = 0.2, color = "red") +
+  geom_point(size = 1, color = color_theme) +
+  geom_line(alpha = 0.8, color = color_theme) +
+  labs(title = "Average store sales, state(red) & school(grey) holidays") +
+  xlab("Sales") +
+  ylab("Date") +
+  theme_template() +
+  scale_x_date(date_breaks = "3 months",  date_minor_breaks = "months", date_labels = "%Y-%b")
+```
+
+# Promotions analysis
+
+```{r message=FALSE, warning=FALSE}
+sales %>%
+  select(store, week_day, promo, sales) %>%
+  group_by(store, week_day, promo) %>%
+  summarise(avg_sales = mean(sales)) %>%
+  mutate(avg_sales = ifelse(avg_sales == 0, NA, avg_sales)) %>%
+  group_by(week_day, promo) %>%
+  summarise(avg_sales = mean(avg_sales, na.rm = TRUE)) %>%
+  ggplot(aes(x = week_day, y = avg_sales, color = promo)) +
+  labs(title = "Average sales at store level by weekday & promotion") +
+  xlab("Week Day") +
+  ylab("Sales") +
+  geom_point() +
+  theme_template()
+```
+From the above plot, we can conclude that `promotions` are most efficient when they are organized at the begging of the week. Also, in most cases, when we saw higher sales on Mondays, can be explained by promotions. 
+
+# Variables correlogram
+
+```{r corrplot of variables, message=FALSE, warning=FALSE}
+library(ggcorrplot)
+sales_for_corr <- sales %>%
+  filter(open == 1) %>%
+  select(sales, year, month, month_day, week_day, promo, state_holiday, school_holiday) %>%
+  mutate(week_day = as.integer(week_day),
+         promo = as.integer(promo),
+         state_holiday = as.integer(state_holiday),
+         school_holiday = as.integer(school_holiday))
+corr <- round(cor(sales_for_corr), 2)
+p.mat <- cor_pmat(sales_for_corr)
+ggcorrplot(corr, hc.order = TRUE, type = "upper", outline.col = "white", colors = c("#3498db", "#ecf0f1", "#c0392b")) +
+  labs(title = "Correlogram of variables") +
+  theme_template() +
+  theme(axis.title = element_blank(),
+        axis.text.y = element_text(angle = 10))
+```
+
+# Modelling 
+From the above analysis, we can conclude strong patterns in `weekdays`, `months` and a strong correlation of sales with `promotions`. And taking into account that our series a long enough, we can try a quick handy model to see if our assumptions are correct. The best match for this quick test will be `Prophet`, because, besides the seasonality, we quickly can add the effects of holidays & promotions. 
+
+```{r forecating with prophet, message=FALSE, warning=FALSE}
+selected_store = 85
+
+store_sales <- sales %>%
+  filter(store == selected_store) %>%
+  select(date, sales, state_holiday, school_holiday, promo) %>%
+  rename(ds = date, 
+         y = sales)
+  
+
+holidays <- store_sales %>%
+  filter(state_holiday != "0" | school_holiday != 0 | promo == 1) %>% 
+  mutate(holiday = ifelse(promo == 1, "Promotion", 
+                          ifelse(state_holiday == "0", "School holiday",
+                                 ifelse(state_holiday == "b", "Easter",
+                                        ifelse(state_holiday == "c", "Christmas", "Other state holiday"))))) %>%
+  select(ds, holiday)
+
+model <- prophet(store_sales, daily.seasonality = FALSE, holidays = holidays)
+forecast_df <- make_future_dataframe(model, periods = 365)
+forecast <- predict(model, forecast_df)
+plot(model, forecast, xlabel = "Date", ylabel = "Sales") + 
+  theme_template() +
+  labs(title = "Actual vs Forecasted Sales")
+```
+
+From the above result, we can conclude that our results look good enough and it worth continuing with deeper analysis. We can see expected results also in the components plot
+
+```{r plot prophet components, message=FALSE, warning=FALSE}
+prophet_plot_components(model, forecast)
+```
+
+To be continued in `Python` ... 
