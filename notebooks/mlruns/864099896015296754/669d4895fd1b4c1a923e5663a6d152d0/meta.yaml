@@ -1,0 +1,15 @@
+artifact_uri: file:///c:/Users/Andreea_Deselnicu/Documents/git/sales_forecasting/notebooks/mlruns/864099896015296754/669d4895fd1b4c1a923e5663a6d152d0/artifacts
+end_time: 1683913775826
+entry_point_name: ''
+experiment_id: '864099896015296754'
+lifecycle_stage: active
+run_id: 669d4895fd1b4c1a923e5663a6d152d0
+run_name: optimized_rf
+run_uuid: 669d4895fd1b4c1a923e5663a6d152d0
+source_name: ''
+source_type: 4
+source_version: ''
+start_time: 1683913771127
+status: 3
+tags: []
+user_id: Andreea_Deselnicu
